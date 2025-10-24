@@ -1,69 +1,53 @@
-import ffmpegPath from "ffmpeg-static";
 import ffmpeg from "fluent-ffmpeg";
-import fs from "fs-extra";
-import path from "path";
+import ffmpegPath from "ffmpeg-static";
+import fs from "fs";
 import fetch from "node-fetch";
-import os from "os";
-
-ffmpeg.setFfmpegPath(ffmpegPath); // ✅ ensures ffmpeg is found, even on Vercel
+import path from "path";
 
 export default async function handler(req, res) {
   try {
-    const { backgroundUrl, overlayUrl, overlayWidth = 0.3, position = "bottomLeft" } = req.body;
+    const { backgroundUrl, overlayUrl, overlayWidth = 0.3, position = "bottomRight" } = req.body;
+    const tmpDir = "/tmp";
+    const bgPath = path.join(tmpDir, "background.mp4");
+    const ovPath = path.join(tmpDir, "overlay.mp4");
+    const outPath = path.join(tmpDir, "output.mp4");
 
-    if (!backgroundUrl || !overlayUrl) {
-      return res.status(400).json({ error: "Missing backgroundUrl or overlayUrl" });
-    }
-
-    const tmpDir = path.join(os.tmpdir(), `overlay-${Date.now()}`);
-    await fs.ensureDir(tmpDir);
-
-    const backgroundPath = path.join(tmpDir, "background.mp4");
-    const overlayPath = path.join(tmpDir, "overlay.mp4");
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    // download helper
-    const downloadFile = async (url, dest) => {
+    async function download(url, dest) {
       const r = await fetch(url);
-      if (!r.ok) throw new Error(`Failed to download: ${url}`);
-      const b = await r.arrayBuffer();
-      await fs.writeFile(dest, Buffer.from(b));
+      const fileStream = fs.createWriteStream(dest);
+      await new Promise((resolve, reject) => {
+        r.body.pipe(fileStream);
+        r.body.on("error", reject);
+        fileStream.on("finish", resolve);
+      });
+    }
+    await Promise.all([download(backgroundUrl, bgPath), download(overlayUrl, ovPath)]);
+
+    ffmpeg.setFfmpegPath(ffmpegPath);
+    const positions = {
+      bottomRight: "W-w-40:H-h-40",
+      bottomLeft: "40:H-h-40",
+      topRight: "W-w-40:40",
+      topLeft: "40:40"
     };
-
-    await Promise.all([
-      downloadFile(backgroundUrl, backgroundPath),
-      downloadFile(overlayUrl, overlayPath)
-    ]);
-
-    // Define overlay positions
-    const posMap = {
-      topLeft: "10:10",
-      topRight: "(main_w-overlay_w-10):10",
-      bottomLeft: "10:(main_h-overlay_h-10)",
-      bottomRight: "(main_w-overlay_w-10):(main_h-overlay_h-10)",
-      center: "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
-    };
-    const pos = posMap[position] || posMap.bottomLeft;
-
-    // 🧠 Proper FFmpeg call using fluent-ffmpeg
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(backgroundPath)
-        .input(overlayPath)
+      ffmpeg(bgPath)
+        .input(ovPath)
         .complexFilter([
-          `[1:v]scale=iw*${overlayWidth}:-1[overlay_scaled];[0:v][overlay_scaled]overlay=${pos}`
+          `[1:v]scale=iw*${overlayWidth}:-1[fg];[0:v][fg]overlay=${positions[position] || positions.bottomRight}`
         ])
-        .outputOptions(["-pix_fmt yuv420p", "-c:a copy"])
-        .save(outputPath)
+        .outputOptions("-c:a copy")
+        .output(outPath)
         .on("end", resolve)
-        .on("error", reject);
+        .on("error", reject)
+        .run();
     });
 
-    const buffer = await fs.readFile(outputPath);
+    const video = fs.readFileSync(outPath);
     res.setHeader("Content-Type", "video/mp4");
-    res.status(200).send(buffer);
-
-    // Cleanup
-    await fs.remove(tmpDir);
-  } catch (err) {
-    console.error("Overlay Error:", err)
+    res.send(video);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+}
