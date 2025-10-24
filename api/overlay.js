@@ -1,104 +1,82 @@
-import ffmpegPath from "ffmpeg-static";
-import ffmpeg from "fluent-ffmpeg";
-import fs from "fs-extra";
+import { exec } from "child_process";
+import fs from "fs";
 import path from "path";
 import fetch from "node-fetch";
+import { promisify } from "util";
 import os from "os";
-import { createClient } from "@supabase/supabase-js";
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const execPromise = promisify(exec);
 
 export default async function handler(req, res) {
   try {
-    const { backgroundUrl, overlayUrl, overlayWidth = 0.3, position = "bottomRight" } = req.body;
-    if (!backgroundUrl || !overlayUrl)
+    const { backgroundUrl, overlayUrl, overlayWidth = 0.3, position = "bottomLeft" } = req.body;
+
+    if (!backgroundUrl || !overlayUrl) {
       return res.status(400).json({ error: "Missing backgroundUrl or overlayUrl" });
+    }
 
-    const tmpDir = path.join(os.tmpdir(), `overlay-${Date.now()}`);
-    await fs.ensureDir(tmpDir);
-
+    // Download both videos to temp directory
+    const tmpDir = os.tmpdir();
     const backgroundPath = path.join(tmpDir, "background.mp4");
     const overlayPath = path.join(tmpDir, "overlay.mp4");
-    const outputPath = path.join(tmpDir, "output.mp4");
+    const outputPath = path.join(tmpDir, `output_${Date.now()}.mp4`);
 
-    // Download input videos
-    const downloadFile = async (url, dest) => {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`Failed to download ${url}`);
-      const b = await r.arrayBuffer();
-      await fs.writeFile(dest, Buffer.from(b));
+    const downloadFile = async (url, outputPath) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Failed to download file: ${response.statusText}`);
+      const buffer = await response.arrayBuffer();
+      fs.writeFileSync(outputPath, Buffer.from(buffer));
     };
 
-    await Promise.all([
-      downloadFile(backgroundUrl, backgroundPath),
-      downloadFile(overlayUrl, overlayPath)
-    ]);
+    await downloadFile(backgroundUrl, backgroundPath);
+    await downloadFile(overlayUrl, overlayPath);
 
-    // Position map
-    const pos = {
-      bottomRight: "(main_w-overlay_w-40):(main_h-overlay_h-40)",
-      bottomLeft: "40:(main_h-overlay_h-40)",
-      topRight: "(main_w-overlay_w-40):40",
-      topLeft: "40:40",
-      center: "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
-    }[position] || "(main_w-overlay_w-40):(main_h-overlay_h-40)";
+    // Determine overlay position
+    let positionFilter;
+    switch (position) {
+      case "topLeft":
+        positionFilter = "x=0:y=0";
+        break;
+      case "topRight":
+        positionFilter = "x=W-w:y=0";
+        break;
+      case "bottomRight":
+        positionFilter = "x=W-w:y=H-h";
+        break;
+      case "bottomLeft":
+      default:
+        positionFilter = "x=0:y=H-h";
+        break;
+    }
 
-    // FFmpeg circular overlay with soft edges
-    await new Promise((resolve, reject) => {
-      ffmpeg(backgroundPath)
-        .input(overlayPath)
-        .complexFilter([
-          // Scale and create circular mask with feathered edges
-          `[1:v]scale=iw*${overlayWidth}:-1,format=rgba,geq='if(lte(hypot(X-W/2,Y-H/2),(min(W,H)/2-10)),255,(255-((hypot(X-W/2,Y-H/2)-(min(W,H)/2-10))*25)))*between(hypot(X-W/2,Y-H/2),(min(W,H)/2-10),(min(W,H)/2))':128:128:128[masked];`,
-          `[0:v][masked]overlay=${pos}:format=auto`
-        ])
-        .outputOptions([
-          "-pix_fmt yuv420p",
-          "-preset ultrafast",
-          "-movflags +faststart"
-        ])
-        .save(outputPath)
-        .on("end", resolve)
-        .on("error", reject);
-    });
+    // 🧠 Correct filter syntax for ffmpeg
+    // - [0:v] = first input (background)
+    // - [1:v] = second input (overlay)
+    // - scale filter applied to overlay before compositing
+    const command = `
+      ffmpeg -y -i "${backgroundPath}" -i "${overlayPath}" \
+      -filter_complex "[1:v]scale=iw*${overlayWidth}:-1[overlay_scaled];[0:v][overlay_scaled]overlay=${positionFilter}" \
+      -c:a copy "${outputPath}"
+    `;
 
-    // Upload to Supabase
-    const videoBuffer = await fs.readFile(outputPath);
-    const fileName = `final_${Date.now()}.mp4`;
-    const { data, error } = await supabase
-      .storage
-      .from(process.env.SUPABASE_BUCKET)
-      .upload(fileName, videoBuffer, {
-        contentType: "video/mp4",
-        upsert: true
-      });
+    console.log("Running command:", command);
+    const { stderr } = await execPromise(command);
+    if (stderr) console.log("FFmpeg stderr:", stderr);
 
-    if (error) throw new Error("Supabase upload failed: " + error.message);
+    // Return video as base64 for debugging or upload to storage
+    const videoBuffer = fs.readFileSync(outputPath);
 
-    const { publicURL } = supabase
-      .storage
-      .from(process.env.SUPABASE_BUCKET)
-      .getPublicUrl(fileName);
+    res.setHeader("Content-Type", "video/mp4");
+    res.status(200).send(videoBuffer);
 
-    // Return public URL
-    res.status(200).json({
-      success: true,
-      url: publicURL
-    });
+    // Clean up
+    fs.unlinkSync(backgroundPath);
+    fs.unlinkSync(overlayPath);
+    fs.unlinkSync(outputPath);
 
-    // Cleanup
-    await fs.remove(tmpDir);
-  } catch (err) {
-  console.error("Overlay API Error:", err);
-  return res.status(500).json({ 
-    error: err.message || "Unknown error",
-    stack: err.stack
-  });
+  } catch (error) {
+    console.error("FFmpeg error:", error);
+    res.status(500).json({ error: error.message });
+  }
 }
 
-}
