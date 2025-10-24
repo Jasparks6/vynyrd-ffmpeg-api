@@ -1,11 +1,11 @@
-import { exec } from "child_process";
-import fs from "fs";
+import ffmpegPath from "ffmpeg-static";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs-extra";
 import path from "path";
 import fetch from "node-fetch";
-import { promisify } from "util";
 import os from "os";
 
-const execPromise = promisify(exec);
+ffmpeg.setFfmpegPath(ffmpegPath); // ✅ ensures ffmpeg is found, even on Vercel
 
 export default async function handler(req, res) {
   try {
@@ -15,68 +15,55 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing backgroundUrl or overlayUrl" });
     }
 
-    // Download both videos to temp directory
-    const tmpDir = os.tmpdir();
+    const tmpDir = path.join(os.tmpdir(), `overlay-${Date.now()}`);
+    await fs.ensureDir(tmpDir);
+
     const backgroundPath = path.join(tmpDir, "background.mp4");
     const overlayPath = path.join(tmpDir, "overlay.mp4");
-    const outputPath = path.join(tmpDir, `output_${Date.now()}.mp4`);
+    const outputPath = path.join(tmpDir, "output.mp4");
 
-    const downloadFile = async (url, outputPath) => {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`Failed to download file: ${response.statusText}`);
-      const buffer = await response.arrayBuffer();
-      fs.writeFileSync(outputPath, Buffer.from(buffer));
+    // download helper
+    const downloadFile = async (url, dest) => {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`Failed to download: ${url}`);
+      const b = await r.arrayBuffer();
+      await fs.writeFile(dest, Buffer.from(b));
     };
 
-    await downloadFile(backgroundUrl, backgroundPath);
-    await downloadFile(overlayUrl, overlayPath);
+    await Promise.all([
+      downloadFile(backgroundUrl, backgroundPath),
+      downloadFile(overlayUrl, overlayPath)
+    ]);
 
-    // Determine overlay position
-    let positionFilter;
-    switch (position) {
-      case "topLeft":
-        positionFilter = "x=0:y=0";
-        break;
-      case "topRight":
-        positionFilter = "x=W-w:y=0";
-        break;
-      case "bottomRight":
-        positionFilter = "x=W-w:y=H-h";
-        break;
-      case "bottomLeft":
-      default:
-        positionFilter = "x=0:y=H-h";
-        break;
-    }
+    // Define overlay positions
+    const posMap = {
+      topLeft: "10:10",
+      topRight: "(main_w-overlay_w-10):10",
+      bottomLeft: "10:(main_h-overlay_h-10)",
+      bottomRight: "(main_w-overlay_w-10):(main_h-overlay_h-10)",
+      center: "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
+    };
+    const pos = posMap[position] || posMap.bottomLeft;
 
-    // 🧠 Correct filter syntax for ffmpeg
-    // - [0:v] = first input (background)
-    // - [1:v] = second input (overlay)
-    // - scale filter applied to overlay before compositing
-    const command = `
-      ffmpeg -y -i "${backgroundPath}" -i "${overlayPath}" \
-      -filter_complex "[1:v]scale=iw*${overlayWidth}:-1[overlay_scaled];[0:v][overlay_scaled]overlay=${positionFilter}" \
-      -c:a copy "${outputPath}"
-    `;
+    // 🧠 Proper FFmpeg call using fluent-ffmpeg
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(backgroundPath)
+        .input(overlayPath)
+        .complexFilter([
+          `[1:v]scale=iw*${overlayWidth}:-1[overlay_scaled];[0:v][overlay_scaled]overlay=${pos}`
+        ])
+        .outputOptions(["-pix_fmt yuv420p", "-c:a copy"])
+        .save(outputPath)
+        .on("end", resolve)
+        .on("error", reject);
+    });
 
-    console.log("Running command:", command);
-    const { stderr } = await execPromise(command);
-    if (stderr) console.log("FFmpeg stderr:", stderr);
-
-    // Return video as base64 for debugging or upload to storage
-    const videoBuffer = fs.readFileSync(outputPath);
-
+    const buffer = await fs.readFile(outputPath);
     res.setHeader("Content-Type", "video/mp4");
-    res.status(200).send(videoBuffer);
+    res.status(200).send(buffer);
 
-    // Clean up
-    fs.unlinkSync(backgroundPath);
-    fs.unlinkSync(overlayPath);
-    fs.unlinkSync(outputPath);
-
-  } catch (error) {
-    console.error("FFmpeg error:", error);
-    res.status(500).json({ error: error.message });
-  }
-}
-
+    // Cleanup
+    await fs.remove(tmpDir);
+  } catch (err) {
+    console.error("Overlay Error:", err)
