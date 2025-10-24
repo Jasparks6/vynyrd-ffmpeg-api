@@ -94,7 +94,11 @@ export default async function handler(req, res) {
     // Cleanup
     await fs.remove(tmpDir);
   } catch (err) {
-    console.error("Overlay API Error:", err);
-    res.status(500).json({ error: err.message });
-  }
+  console.error("Overlay API Error:", err);
+  return res.status(500).json({ 
+    error: err.message || "Unknown error",
+    stack: err.stack
+  });
+}
+
 }
