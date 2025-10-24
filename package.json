@@ -1,0 +1,10 @@
+{
+  "name": "ffmpeg-overlay-api",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "fluent-ffmpeg": "^2.1.2",
+    "ffmpeg-static": "^5.1.0",
+    "node-fetch": "2.6.7"
+  }
+}
